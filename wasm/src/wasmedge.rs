@@ -18,8 +18,7 @@ limitations under the License.
 
 use std::{
     fs::OpenOptions,
-    os::unix::prelude::{IntoRawFd, RawFd},
-    process::exit,
+    process::Command,
     sync::Arc,
 };
 
@@ -42,17 +41,13 @@ use containerd_shim::{
 };
 use log::debug;
 use nix::{
-    errno::Errno,
-    fcntl::OFlag,
-    sched::{setns, CloneFlags},
-    sys::{signal::kill, stat::Mode},
-    unistd::{dup2, fork, ForkResult, Pid},
+    sys::signal::kill,
+    unistd::Pid,
 };
 use oci_spec::runtime::Spec;
 use wasmedge_sdk::{
     config::{CommonConfigOptions, ConfigBuilder, HostRegistrationConfigOptions},
-    error::WasmEdgeError,
-    params, PluginManager, Vm,
+    PluginManager, Vm,
 };
 
 pub type ExecProcess = ProcessTemplate<WasmEdgeExecLifecycle>;
@@ -157,7 +152,6 @@ impl ContainerFactory<WasmEdgeContainer> for WasmEdgeContainerFactory {
 impl ProcessLifecycle<InitProcess> for WasmEdgeInitLifecycle {
     async fn start(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
         let spec = &p.lifecycle.spec;
-        let vm = p.lifecycle.prototype_vm.clone();
         let args = get_args(spec);
         let envs = get_envs(spec);
         let rootfs = spec
@@ -174,25 +168,17 @@ impl ProcessLifecycle<InitProcess> for WasmEdgeInitLifecycle {
             "start wasm with args: {:?}, envs: {:?}, preopens: {:?}",
             args, envs, preopens
         );
-        match unsafe {
-            fork().map_err(other_error!(
-                e,
-                format!("failed to fork process for {}", p.id)
-            ))?
-        } {
-            ForkResult::Parent { child } => {
-                let init_pid = child.as_raw();
+
+        match run_wasi_as_child(args, p) {
+            Ok(pid) => {
                 p.state = Status::RUNNING;
-                p.pid = init_pid;
+                p.pid = pid as i32;
             }
-            ForkResult::Child => {
-                match run_wasi_func(vm, args, envs, preopens, p) {
-                    Ok(_) => exit(0),
-                    // TODO add a pipe? to return detailed error message
-                    Err(e) => exit(e.to_exit_code()),
-                }
+            Err(_) => {
+                format!("failed to fork process for {}", p.id);
             }
         }
+
         Ok(())
     }
 
@@ -340,13 +326,18 @@ pub fn get_args(spec: &Spec) -> Vec<String> {
     args.to_vec()
 }
 
-pub fn maybe_open_stdio(path: &str) -> Result<Option<RawFd>, std::io::Error> {
+pub enum RunError {
+    IO(std::io::Error),
+    NoRootInSpec,
+}
+
+pub fn maybe_open_stdio(path: &str) -> Result<Option<std::fs::File>, std::io::Error> {
     if path.is_empty() {
         return Ok(None);
     }
 
     match OpenOptions::new().read(true).write(true).open(path) {
-        Ok(f) => Ok(Some(f.into_raw_fd())),
+        Ok(f) => Ok(Some(f)),
         Err(err) => match err.kind() {
             std::io::ErrorKind::NotFound => Ok(None),
             _ => Err(err),
@@ -354,49 +345,14 @@ pub fn maybe_open_stdio(path: &str) -> Result<Option<RawFd>, std::io::Error> {
     }
 }
 
-pub enum RunError {
-    WasmEdge(Box<WasmEdgeError>),
-    IO(std::io::Error),
-    NoRootInSpec,
-    Sys(Errno),
-}
-
-impl RunError {
-    pub fn to_exit_code(&self) -> i32 {
-        match &self {
-            RunError::WasmEdge(_) => -100,
-            RunError::IO(_) => -101,
-            RunError::NoRootInSpec => -102,
-            RunError::Sys(e) => -(*e as i32),
-        }
-    }
-}
-
-fn run_wasi_func(
-    mut vm: Vm,
-    args: Vec<String>,
-    envs: Vec<String>,
-    preopens: Vec<String>,
-    p: &InitProcess,
-) -> Result<(), RunError> {
+fn run_wasi_as_child(args: Vec<String>, p: &InitProcess) -> Result<u32, RunError> {
     let netns = &*p.lifecycle.netns;
-    if !netns.is_empty() {
-        let netns_fd =
-            nix::fcntl::open(netns, OFlag::O_CLOEXEC, Mode::empty()).map_err(RunError::Sys)?;
-        setns(netns_fd, CloneFlags::CLONE_NEWNET).map_err(RunError::Sys)?;
-    }
-    let mut wasi_instance = vm.wasi_module().map_err(RunError::WasmEdge)?;
-    wasi_instance.initialize(
-        Some(args.iter().map(|s| s as &str).collect()),
-        Some(envs.iter().map(|s| s as &str).collect()),
-        Some(preopens.iter().map(|s| s as &str).collect()),
-    );
+
     let mut cmd = args[0].clone();
     let stripped = args[0].strip_prefix(std::path::MAIN_SEPARATOR);
     if let Some(stripped_cmd) = stripped {
         cmd = stripped_cmd.to_string()
     }
-    let stdio = p.stdio.clone();
 
     let rootfs = p
         .lifecycle
@@ -406,22 +362,30 @@ fn run_wasi_func(
         .ok_or(RunError::NoRootInSpec)?
         .path();
     let mod_path = rootfs.join(cmd);
-    let vm = vm
-        .register_module_from_file("main", mod_path)
-        .map_err(RunError::WasmEdge)?;
 
+    let mut child = Command::new("wasmkeeper");
+
+    let stdio = p.stdio.clone();
     if let Some(stdin) = maybe_open_stdio(&stdio.stdin).map_err(RunError::IO)? {
-        dup2(stdin, 0).map_err(RunError::Sys)?;
+        child.stdin(stdin);
     }
-    if let Some(stdin) = maybe_open_stdio(&stdio.stdout).map_err(RunError::IO)? {
-        dup2(stdin, 1).map_err(RunError::Sys)?;
+    if let Some(stdout) = maybe_open_stdio(&stdio.stdout).map_err(RunError::IO)? {
+        child.stdout(stdout);
     }
-    if let Some(stdin) = maybe_open_stdio(&stdio.stderr).map_err(RunError::IO)? {
-        dup2(stdin, 2).map_err(RunError::Sys)?;
+    if let Some(stderr) = maybe_open_stdio(&stdio.stderr).map_err(RunError::IO)? {
+        child.stderr(stderr);
     }
-    vm.run_func(Some("main"), "_start", params!())
-        .map_err(RunError::WasmEdge)?;
-    Ok(())
+
+    let pid = child
+        .arg("--netns")
+        .arg(netns)
+        .arg("--mod-path")
+        .arg(mod_path)
+        .spawn()
+        .map_err(|e| RunError::IO(e))?
+        .id();
+
+    Ok(pid)
 }
 
 // any wasm runtime implementation should implement this function
