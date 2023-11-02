@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use oci_spec::runtime::Spec;
+use oci_spec::runtime::{Spec, LinuxResources};
 
 #[cfg(feature = "wasmedge")]
 pub fn get_preopens(spec: &Spec) -> Vec<String> {
@@ -104,4 +104,11 @@ pub(crate) fn get_cgroup_path(spec: &Spec) -> Option<String> {
         .as_ref()
         .and_then(|linux| linux.cgroups_path().as_ref())
         .map(|path| path.display().to_string())
+}
+
+#[cfg(feature = "wasmedge")]
+pub(crate) fn get_linux_resources(spec: &Spec) -> Option<&LinuxResources> {
+    spec.linux()
+        .as_ref()
+        .and_then(|linux| linux.resources().as_ref())
 }

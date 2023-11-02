@@ -411,7 +411,7 @@ dependencies = [
 [[package]]
 name = "containerd-sandbox"
 version = "0.1.0"
-source = "git+https://github.com/WasmFunction/rust-extensions#072a7ea09a44e735614d944a3a18065ec5591adb"
+source = "git+https://github.com/WasmFunction/rust-extensions#02077848faadfb61d2eacbaf69cb3393c05dcaa5"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -439,7 +439,7 @@ dependencies = [
 [[package]]
 name = "containerd-shim"
 version = "0.3.0"
-source = "git+https://github.com/WasmFunction/rust-extensions#072a7ea09a44e735614d944a3a18065ec5591adb"
+source = "git+https://github.com/WasmFunction/rust-extensions#02077848faadfb61d2eacbaf69cb3393c05dcaa5"
 dependencies = [
  "async-trait",
  "cgroups-rs 0.2.11",
@@ -470,7 +470,7 @@ dependencies = [
 [[package]]
 name = "containerd-shim-protos"
 version = "0.2.0"
-source = "git+https://github.com/WasmFunction/rust-extensions#072a7ea09a44e735614d944a3a18065ec5591adb"
+source = "git+https://github.com/WasmFunction/rust-extensions#02077848faadfb61d2eacbaf69cb3393c05dcaa5"
 dependencies = [
  "async-trait",
  "protobuf 3.3.0",

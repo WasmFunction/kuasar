@@ -28,6 +28,7 @@ use containerd_shim::{
         task::TaskService,
         util::{mkdir, mount_rootfs, read_spec},
     },
+    cgroup::update_resources,
     error::Error,
     io::Stdio,
     monitor::{Subject, Topic},
@@ -44,7 +45,9 @@ use wasmedge_sdk::{
     PluginManager, Vm,
 };
 
-use crate::utils::{get_args, get_cgroup_path, get_envs, get_preopens, get_rootfs};
+use crate::utils::{
+    get_args, get_cgroup_path, get_envs, get_linux_resources, get_preopens, get_rootfs,
+};
 
 pub type ExecProcess = ProcessTemplate<WasmEdgeExecLifecycle>;
 pub type InitProcess = ProcessTemplate<WasmEdgeInitLifecycle>;
@@ -339,29 +342,36 @@ fn run_wasi_as_child(args: Vec<String>, spec: &Spec, p: &InitProcess) -> Result<
         child.stderr(stderr);
     }
 
-    let pid = child
+    let mut child = child
         .arg("--netns")
         .arg(netns)
         .arg("--mod-path")
         .arg(mod_path)
         .spawn()
-        .map_err(|e| RunError::IO(e))?
-        .id();
+        .map_err(|e| RunError::IO(e))?;
 
     if let Some(cgroup_path) = get_cgroup_path(spec) {
         // Add child process to Cgroup
-        if let Err(_) = Cgroup::new(
+        if let Err(err) = Cgroup::new(
             cgroups_rs::hierarchies::auto(),
             cgroup_path.trim_start_matches('/'),
         )
-        .and_then(|cgroup| cgroup.add_task_by_tgid(CgroupPid::from(pid as u64)))
+        .and_then(|cgroup| cgroup.add_task_by_tgid(CgroupPid::from(child.id() as u64)))
         {
-            println!("failed to add to cgroup");
+            debug!("failed to add to cgroup: {err}");
+            let _ = child.kill();
             return Err(RunError::Cgroup);
+        }
+        if let Some(resources) = get_linux_resources(spec) {
+            update_resources(child.id(), resources).map_err(|err| {
+                debug!("failed to set linux resources: {err}");
+                let _ = child.kill();
+                RunError::Cgroup
+            })?;
         }
     }
 
-    Ok(pid)
+    Ok(child.id())
 }
 
 // any wasm runtime implementation should implement this function
